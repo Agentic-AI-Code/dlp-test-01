@@ -29,9 +29,19 @@ import os
 import uuid # For generating unique identifiers for temporary resources
 import math # For calculations like number of chunks
 import time # For polling DLP job status
+import logging # For structured logging
 from google.cloud import storage # Client library for Google Cloud Storage
 from google.cloud import dlp_v2 # Client library for Google Cloud Data Loss Prevention
 from google.cloud import bigquery # Client library for Google Cloud BigQuery
+
+# --- Logging Configuration ---
+# Configure basic logging. This will make log messages include timestamp, level, and the message.
+# In a Cloud Run environment, these logs will automatically be sent to Cloud Logging.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 # --- Configuration (Fetched from Environment Variables in Cloud Run Job) ---
 # These variables define the operational parameters for the script.
@@ -56,10 +66,12 @@ dlp_client = dlp_v2.DlpServiceClient() # Client for interacting with Google Clou
 bigquery_client = bigquery.Client(project=BIGQUERY_PROJECT_ID) # Client for interacting with BigQuery, configured for the specified project.
 
 def log_message(message):
-    """Helper function for logging messages to the console."""
-    # Simple print statement for logging. In a production system,
-    # this might integrate with Cloud Logging or another logging framework.
-    print(f"[PROCESS] {message}")
+    """Helper function for logging informational messages."""
+    # This function is now a wrapper around logging.info.
+    # The "[PROCESS]" prefix is removed as the logger format already includes levelname.
+    logging.info(message)
+
+# --- Core Script Functions ---
 
 def split_gcs_file_into_chunks(bucket_name, input_blob_name, chunk_size_bytes, temp_chunk_prefix):
     """
@@ -83,12 +95,12 @@ def split_gcs_file_into_chunks(bucket_name, input_blob_name, chunk_size_bytes, t
     try:
         source_blob.reload() # Fetch blob metadata, including its size.
     except Exception as e:
-        log_message(f"Error accessing source blob gs://{bucket_name}/{input_blob_name}: {e}")
+        logging.error(f"Error accessing source blob gs://{bucket_name}/{input_blob_name}: {e}", exc_info=True)
         raise # Re-raise the exception to be handled by the main pipeline.
 
     file_size = source_blob.size # Get the size of the source file in bytes.
     if not file_size:
-        log_message(f"File gs://{bucket_name}/{input_blob_name} is empty or size could not be determined.")
+        logging.warning(f"File gs://{bucket_name}/{input_blob_name} is empty or size could not be determined.")
         return [] # Return an empty list if the file is empty.
 
     # Calculate the number of chunks needed. math.ceil ensures the last chunk captures any remainder.
@@ -117,6 +129,9 @@ def split_gcs_file_into_chunks(bucket_name, input_blob_name, chunk_size_bytes, t
         # For very large chunks that might exceed instance memory, a streaming approach
         # or GCS compose/rewrite operations (if applicable to ranges) would be more robust.
         # However, `download_as_bytes` with `start` and `end` is suitable for moderately sized chunks.
+        # WARNING: Ensure that the CHUNK_SIZE_BYTES is configured appropriately for the available memory
+        # in your execution environment (e.g., Cloud Run instance). Processing very large chunks
+        # directly in memory can lead to out-of-memory errors.
         chunk_data = source_blob.download_as_bytes(start=start_byte, end=end_byte)
         
         # Upload the downloaded chunk data to the new temporary blob in GCS.
@@ -177,7 +192,8 @@ def trigger_dlp_inspection(project_id, gcs_uri, inspect_template_name, bq_projec
     }
 
     # Parent resource for creating the DLP job (project and location).
-    # DLP jobs are regional, 'global' can be used or a specific region like 'us-west1'.
+    # DLP jobs are regional; 'global' is used here to process data regardless of its GCS bucket region.
+    # For data residency requirements, specify a region (e.g., 'us-west1').
     parent = f"projects/{project_id}/locations/global"
 
     try:
@@ -190,6 +206,8 @@ def trigger_dlp_inspection(project_id, gcs_uri, inspect_template_name, bq_projec
         # --- Polling for DLP Job Completion ---
         # This is a basic polling mechanism. For production, consider using Pub/Sub notifications
         # for a more event-driven and efficient approach.
+        # Using Pub/Sub is strongly recommended for production workloads to avoid long-running polling tasks
+        # and to handle responses asynchronously and more reliably.
         job_done = False
         max_tries = 60 # Maximum number of polling attempts.
         tries = 0
@@ -201,13 +219,13 @@ def trigger_dlp_inspection(project_id, gcs_uri, inspect_template_name, bq_projec
             
             if job.state == dlp_v2.DlpJob.JobState.DONE:
                 job_done = True
-                log_message(f"DLP Job {response.name} completed.")
+                logging.info(f"DLP Job {response.name} completed.")
             elif job.state in [dlp_v2.DlpJob.JobState.FAILED, dlp_v2.DlpJob.JobState.CANCELED]:
-                log_message(f"DLP Job {response.name} failed or was canceled. State: {job.state}")
-                # Log detailed errors if available from the job.
+                error_message = f"DLP Job {response.name} failed or was canceled. State: {job.state}"
                 if job.errors:
-                    for error in job.errors:
-                        log_message(f"DLP Job Error: {error.details.message if error.details else 'No details'}")
+                    for error_detail in job.errors:
+                        error_message += f" Details: {error_detail.details.message if error_detail.details else 'No details'}"
+                logging.error(error_message)
                 raise Exception(f"DLP Job {response.name} failed or canceled.")
             else:
                 # Job is still pending or running.
@@ -216,12 +234,12 @@ def trigger_dlp_inspection(project_id, gcs_uri, inspect_template_name, bq_projec
         
         if not job_done:
             # Job did not complete within the allocated polling time.
-            log_message(f"DLP Job {response.name} timed out after {max_tries * poll_interval_seconds} seconds.")
+            logging.error(f"DLP Job {response.name} timed out after {max_tries * poll_interval_seconds} seconds.")
             raise Exception(f"DLP Job {response.name} timed out.")
 
         return bq_table_id # Return the table ID upon successful completion.
     except Exception as e:
-        log_message(f"Error creating or monitoring DLP job for {gcs_uri}: {e}")
+        logging.error(f"Error creating or monitoring DLP job for {gcs_uri}: {e}", exc_info=True)
         raise # Re-raise the exception.
 
 def merge_bigquery_tables(source_project_id, source_dataset_id, table_id_prefix, num_tables, dest_table_id):
@@ -236,10 +254,10 @@ def merge_bigquery_tables(source_project_id, source_dataset_id, table_id_prefix,
         num_tables (int): The number of chunk tables to merge.
         dest_table_id (str): The ID of the destination table where merged data will be stored.
     """
-    log_message(f"Starting merge of tables with prefix '{table_id_prefix}' into '{source_project_id}.{source_dataset_id}.{dest_table_id}'.")
+    logging.info(f"Starting merge of tables with prefix '{table_id_prefix}' into '{source_project_id}.{source_dataset_id}.{dest_table_id}'.")
     
     if num_tables == 0:
-        log_message("No tables to merge.")
+        logging.info("No tables to merge.")
         return
 
     # Construct a list of SELECT statements, one for each source table.
@@ -258,15 +276,15 @@ def merge_bigquery_tables(source_project_id, source_dataset_id, table_id_prefix,
     CREATE OR REPLACE TABLE `{source_project_id}.{source_dataset_id}.{dest_table_id}` AS
     {' UNION ALL '.join(union_queries)}
     """
-    log_message(f"Executing BigQuery merge SQL: \n{merge_sql}")
+    logging.info(f"Executing BigQuery merge SQL: \n{merge_sql}")
 
     try:
         # Execute the merge query using the BigQuery client.
         query_job = bigquery_client.query(merge_sql)
         query_job.result() # Wait for the BigQuery job to complete.
-        log_message(f"Successfully merged tables into `{source_project_id}.{source_dataset_id}.{dest_table_id}`.")
+        logging.info(f"Successfully merged tables into `{source_project_id}.{source_dataset_id}.{dest_table_id}`.")
     except Exception as e:
-        log_message(f"Error merging BigQuery tables: {e}")
+        logging.error(f"Error merging BigQuery tables: {e}", exc_info=True)
         raise # Re-raise the exception.
 
 def cleanup_temp_chunks(bucket_name, temp_chunk_gcs_uris):
@@ -277,7 +295,7 @@ def cleanup_temp_chunks(bucket_name, temp_chunk_gcs_uris):
         bucket_name (str): The name of the GCS bucket containing the chunks.
         temp_chunk_gcs_uris (list): A list of GCS URIs of the temporary chunks to delete.
     """
-    log_message("Cleaning up temporary chunk files...")
+    logging.info("Cleaning up temporary chunk files...")
     bucket = storage_client.bucket(bucket_name) # Get the GCS bucket object.
     for gcs_uri in temp_chunk_gcs_uris:
         # Extract the blob name from the GCS URI.
@@ -285,16 +303,16 @@ def cleanup_temp_chunks(bucket_name, temp_chunk_gcs_uris):
         try:
             blob = bucket.blob(blob_name) # Get the blob object.
             blob.delete() # Delete the blob.
-            log_message(f"Deleted temp chunk: {gcs_uri}")
+            logging.info(f"Deleted temp chunk: {gcs_uri}")
         except Exception as e:
             # Log a warning if a chunk cannot be deleted, but don't let it fail the whole process.
-            log_message(f"Warning: Could not delete temp chunk {gcs_uri}: {e}")
+            logging.warning(f"Could not delete temp chunk {gcs_uri}: {e}", exc_info=True)
 
 def main():
     """
     Main function to orchestrate the CSV de-identification pipeline.
     """
-    log_message("Starting CSV De-identification Pipeline.")
+    logging.info("Starting CSV De-identification Pipeline.")
 
     # Validate that all required environment variables are set.
     required_env_vars = [
@@ -309,7 +327,7 @@ def main():
             "DLP_PROJECT_ID": DLP_PROJECT_ID, "DLP_INSPECT_TEMPLATE": DLP_INSPECT_TEMPLATE,
             "BIGQUERY_PROJECT_ID": BIGQUERY_PROJECT_ID, "BIGQUERY_DATASET_ID": BIGQUERY_DATASET_ID
         }
-        log_message(f"Error: Missing one or more required environment variables. Current values: {missing_vars_details}")
+        logging.error(f"Missing one or more required environment variables. Current values: {missing_vars_details}")
         # In a Cloud Run Job, returning (or raising an unhandled exception) will mark the task as failed.
         return # Or raise ValueError(...)
 
@@ -329,7 +347,7 @@ def main():
         )
 
         if not temp_chunk_uris:
-            log_message("No chunks were created. This might be due to an empty input file or an error during chunking. Exiting.")
+            logging.warning("No chunks were created. This might be due to an empty input file or an error during chunking. Exiting.")
             return # Exit if no chunks were made.
 
         # Step 2-5: Trigger DLP inspection for each chunk and store findings in BigQuery.
@@ -351,7 +369,7 @@ def main():
             )
             processed_table_ids.append(bq_table_id_for_chunk) # Keep track of tables created.
         
-        log_message("All chunks processed by DLP.")
+        logging.info("All chunks processed by DLP.")
 
         # Step 6: Merge the individual BigQuery tables (containing DLP findings for each chunk)
         # into a single consolidated table.
@@ -364,31 +382,43 @@ def main():
                 MERGED_BIGQUERY_TABLE_ID # The name of the final merged table.
             )
         else:
-            log_message("No DLP findings tables to merge (e.g., if all chunks were empty or failed before BQ table creation).")
+            logging.info("No DLP findings tables to merge (e.g., if all chunks were empty or failed before BQ table creation).")
 
-        log_message("Pipeline completed successfully.")
+        logging.info("Pipeline completed successfully.")
 
     except Exception as e:
         # Catch any exceptions that occurred during the pipeline execution.
-        log_message(f"Pipeline failed: {e}")
+        logging.error(f"Pipeline failed: {e}", exc_info=True)
         # Re-raising the exception is important for Cloud Run Jobs,
         # as it signals that the job task failed.
         raise
     finally:
         # Step 7: Cleanup - Delete temporary GCS chunk files.
-        # This block executes whether the pipeline succeeded or failed (if temp_chunk_uris is populated).
+    # This block executes whether the pipeline succeeded or failed (if temp_chunk_uris is populated),
+    # ensuring that temporary data does not persist unnecessarily.
         if temp_chunk_uris:
             cleanup_temp_chunks(GCS_BUCKET_NAME, temp_chunk_uris)
-        log_message("Exiting script.")
+        logging.info("Exiting script.")
 
 
 if __name__ == "__main__":
     # This is the entry point when the script is executed.
-    # For Cloud Run Jobs, the job execution starts from here.
-    # The script is designed to be run as a single task that processes all chunks sequentially.
-    # To parallelize (e.g., if using Cloud Run Jobs with multiple tasks),
-    # each task would typically be responsible for a subset of chunks or a different part of the workload.
-    # This script, as written, would have each task (if parallelism > 1) attempt to do the whole job,
-    # which is not the intended use of Cloud Run Job task parallelism without further modification
-    # to divide work based on CLOUD_RUN_TASK_INDEX and CLOUD_RUN_TASK_COUNT.
+    # For Cloud Run Jobs, the job execution starts from here by invoking the main() function.
+    # The script is designed to be run as a single task that processes the entire input file sequentially (chunk by chunk).
+    #
+    # Regarding Parallelism (Cloud Run Jobs):
+    # If this script were to be used in a Cloud Run Job with task parallelism (CLOUD_RUN_TASK_COUNT > 1),
+    # it would require modification. Currently, each task instance would attempt to process the *entire* input file,
+    # leading to redundant work and potential conflicts (e.g., multiple tasks trying to create/delete the same GCS chunks
+    # or write to the same BigQuery tables, though unique job_id_suffix for chunks helps mitigate some of this).
+    #
+    # To leverage Cloud Run Job task parallelism effectively, the script would need to:
+    # 1. Identify the current task index (via CLOUD_RUN_TASK_INDEX environment variable).
+    # 2. Determine the total number of tasks (via CLOUD_RUN_TASK_COUNT environment variable).
+    # 3. Divide the workload (e.g., assign a specific subset of chunks to each task).
+    #    This might involve:
+    #    a. A preliminary step (or task 0) to list/create all chunks.
+    #    b. Each task then processes only chunks where `chunk_index % CLOUD_RUN_TASK_COUNT == CLOUD_RUN_TASK_INDEX`.
+    #    c. The merging of BigQuery tables and cleanup of chunks would likely need to be handled by a designated
+    #       final task or managed carefully to avoid race conditions.
     main()
